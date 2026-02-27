@@ -72,14 +72,23 @@ class CronService:
         self._store: CronStore | None = None
         self._timer_task: asyncio.Task | None = None
         self._running = False
+        self._last_mtime: float = 0
     
-    def _load_store(self) -> CronStore:
-        """Load jobs from disk."""
-        if self._store:
-            return self._store
+    def _load_store(self, force: bool = False) -> CronStore:
+        """Load jobs from disk, checking for external modifications."""
+        if not force and self._store:
+            # Check if file changed on disk
+            if self.store_path.exists():
+                mtime = self.store_path.stat().st_mtime
+                if mtime <= self._last_mtime:
+                    return self._store
+                logger.debug("Cron: reloading store due to external modification")
+            else:
+                return self._store
         
         if self.store_path.exists():
             try:
+                self._last_mtime = self.store_path.stat().st_mtime
                 data = json.loads(self.store_path.read_text(encoding="utf-8"))
                 jobs = []
                 for j in data.get("jobs", []):
@@ -117,6 +126,7 @@ class CronService:
                 self._store = CronStore()
         else:
             self._store = CronStore()
+            self._last_mtime = 0
         
         return self._store
     
@@ -162,7 +172,9 @@ class CronService:
             ]
         }
         
-        self.store_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        content = json.dumps(data, indent=2, ensure_ascii=False)
+        self.store_path.write_text(content, encoding="utf-8")
+        self._last_mtime = self.store_path.stat().st_mtime
     
     async def start(self) -> None:
         """Start the cron service."""
@@ -202,23 +214,41 @@ class CronService:
         if self._timer_task:
             self._timer_task.cancel()
         
-        next_wake = self._get_next_wake_ms()
-        if not next_wake or not self._running:
+        if not self._running:
             return
         
-        delay_ms = max(0, next_wake - _now_ms())
-        delay_s = delay_ms / 1000
+        next_wake = self._get_next_wake_ms()
+        
+        # Even if there are no jobs, we sleep and check again later 
+        # to detect new jobs added via CLI.
+        if not next_wake:
+            delay_s = 10.0  # Check every 10s if no jobs exist
+        else:
+            delay_ms = max(0, next_wake - _now_ms())
+            delay_s = min(delay_ms / 1000, 30.0) # Check at least every 30s
         
         async def tick():
-            await asyncio.sleep(delay_s)
-            if self._running:
-                await self._on_timer()
+            try:
+                await asyncio.sleep(delay_s)
+                if self._running:
+                    await self._on_timer()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error("Cron timer error: {}", e)
+                # Re-arm even on error to keep the loop alive
+                if self._running:
+                    self._arm_timer()
         
         self._timer_task = asyncio.create_task(tick())
     
     async def _on_timer(self) -> None:
         """Handle timer tick - run due jobs."""
+        # Force reload to see if CLI added jobs
+        self._load_store()
+        
         if not self._store:
+            self._arm_timer()
             return
         
         now = _now_ms()
@@ -227,10 +257,11 @@ class CronService:
             if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
         ]
         
-        for job in due_jobs:
-            await self._execute_job(job)
+        if due_jobs:
+            for job in due_jobs:
+                await self._execute_job(job)
+            self._save_store()
         
-        self._save_store()
         self._arm_timer()
     
     async def _execute_job(self, job: CronJob) -> None:
